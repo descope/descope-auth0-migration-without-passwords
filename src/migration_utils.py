@@ -17,31 +17,51 @@ AUTH0_TENANT_ID = os.getenv("AUTH0_TENANT_ID")
 DESCOPE_PROJECT_ID = os.getenv("DESCOPE_PROJECT_ID")
 DESCOPE_MANAGEMENT_KEY = os.getenv("DESCOPE_MANAGEMENT_KEY")
 
-def api_request_with_retry(action, url, headers, data=None, max_retries=4):
+def api_request_with_retry(action, url, headers, data=None, max_retries=4, timeout=10):
     """
-    Handles API requests with additional retry
+    Handles API requests with additional retry on timeout and rate limit.
 
     Args:
-    - action (string): get or post
+    - action (string): 'get' or 'post'
     - url (string): The URL of the path for the api request
+    - headers (dict): Headers to be sent with the request
     - data (json): Optional and used only for post, but the payload to post
     - max_retries (int): The max number of retries
+    - timeout (int): The timeout for the request in seconds
     Returns:
     - API Response
     - Or None
     """
     retries = 0
     while retries < max_retries:
-        if action == "get":
-            response = requests.get(url, headers=headers)
-        else:
-            response = requests.post(url, headers=headers, data=data)
-        if response.status_code != 429:
-            return response
-        retries += 1
-        wait_time = 5 ** retries
-        logging.info(f"Rate limit reached. Retrying in {wait_time} seconds...")
-        time.sleep(wait_time)
+        try:
+            if action == "get":
+                response = requests.get(url, headers=headers, timeout=timeout)
+            else:
+                response = requests.post(url, headers=headers, data=data, timeout=timeout)
+
+            if response.status_code != 429:  # Not a rate limit error, proceed with response
+                return response
+
+            # If rate limit error, prepare for retry
+            retries += 1
+            wait_time = 5 ** retries
+            logging.info(f"Rate limit reached. Retrying in {wait_time} seconds...")
+            time.sleep(wait_time)
+
+        except requests.exceptions.ReadTimeout as e:
+            # Handle read timeout exception
+            logging.warning(f"Read timed out. (read timeout={timeout}): {e}")
+            retries += 1
+            wait_time = 5 ** retries
+            logging.info(f"Retrying attempt {retries}/{max_retries}...")
+            time.sleep(wait_time)  # Wait for 5 seconds before retrying or use a backoff strategy
+
+        except requests.exceptions.RequestException as e:
+            # Handle other request exceptions
+            logging.error(f"A request exception occurred: {e}")
+            break  # In case of other exceptions, you may want to break the loop
+
     logging.error("Max retries reached. Giving up.")
     return None
 
@@ -280,27 +300,86 @@ def create_descope_user(user):
     Args:
     - user (dict): A dictionary containing user details fetched from Auth0 API.
     """
-    payload_data = {
-        "loginId": user["email"],
-        "email": user["email"],
-        "verifiedEmail": user["email_verified"],
-        "displayName": user["name"],
-        "invite": False,
-        "test": False,
-        "picture": user["picture"],
-    }
-    payload = json.dumps(payload_data)
+    try:
+        for identity in user.get("identities", []):
+            if "Username" in identity["connection"]:
+                loginId = user.get("email")
+            elif "sms" in identity["connection"]:
+                loginId = user.get("phone_number")
+            elif "-" in identity["connection"]:
+                loginId = identity["connection"].split("-")[0] + "-" + identity["user_id"]
+            else:
+                loginId = identity["connection"] + "-" + identity["user_id"]
+            
+            payload_data = {
+                "loginId": loginId,
+                "displayName": user.get("name"),
+                "invite": False,
+                "test": False,
+                "picture": user.get("picture"),
+                "customAttributes": {
+                    "connection": identity.get("connection"),
+                    "freshlyMigrated": True
+                }
+            }
+
+            # Add email and verifiedEmail only if email is present and not empty
+            if user.get("email"):  # This will be False if email is None or an empty string
+                payload_data["email"] = user["email"]
+                payload_data["verifiedEmail"] = user.get("email_verified", False)
+
+            if identity.get("provider") == "sms":
+                payload_data.update({
+                    "phone": user.get("phone_number"),
+                    "verifiedPhone": user.get("phone_verified", False)
+                })
+
+            # Check if the user is blocked and set status accordingly
+            status = "disabled" if user.get("blocked", False) else "enabled"
+
+            # Prepare API call to create or update the user
+            payload = json.dumps(payload_data)
+            headers = {
+                "Authorization": f"Bearer {DESCOPE_PROJECT_ID}:{DESCOPE_MANAGEMENT_KEY}",
+                "Content-Type": "application/json",
+            }
+            
+            # Create or update user profile
+            success = create_or_update_user(payload, headers)
+            if success == True:        
+                # Update user status
+                success = update_user_status(loginId, status, headers)
+            else:
+                logging.warning(f"User failed to create {user}")    
+
+    except Exception as e:
+        logging.warning(f"User failed to create {user}")
+        logging.warning(e)
+
+def create_or_update_user(payload, headers):
     url = "https://api.descope.com/v1/mgmt/user/create"
-    headers = {
-        "Authorization": f"Bearer {DESCOPE_PROJECT_ID}:{DESCOPE_MANAGEMENT_KEY}",
-        "Content-Type": "application/json",
-    }
     response = api_request_with_retry("post", url, headers=headers, data=payload)
     if response.status_code != 200:
-        logging.error(f"Unable to create user.  Status code: {response.status_code}")
+        logging.error(f"Unable to create or update user. Status code: {response.status_code}")
+        return False
     else:
-        logging.info("User successfully created")
-        logging.info(response.text)
+        logging.info("User successfully created or updated")
+        return True
+
+def update_user_status(loginId, status, headers):
+    active_inactive_payload = {
+        "loginId": loginId,
+        "status": status
+    }
+    payload = json.dumps(active_inactive_payload)
+    url = "https://api.descope.com/v1/mgmt/user/update/status"
+    response = api_request_with_retry("post", url, headers=headers, data=payload)
+    if response.status_code != 200:
+        logging.error(f"Failed to set user status. Status code: {response.status_code}")
+        return False
+    else:
+        logging.info("Successfully set user status")
+        return True
 
 def add_user_to_descope_role(user,role):
     """
@@ -374,7 +453,6 @@ def add_descope_user_to_tenant(tenant, loginId):
         "tenantId": tenant
     }
     payload = json.dumps(payload_data)
-    print(payload)
 
     # Endpoint
     url = "https://api.descope.com/v1/mgmt/user/update/tenant/add"
@@ -396,41 +474,56 @@ def add_descope_user_to_tenant(tenant, loginId):
 
 ### Begin Process Functions
 
-def process_users(api_response_users):
+def process_users(api_response_users, dry_run):
     """
     Process the list of users from Auth0 by mapping and creating them in Descope.
 
     Args:
     - api_response_users (list): A list of users fetched from Auth0 API.
     """
-    for user in api_response_users:
-        create_descope_user(user)
+    if dry_run:
+        logging.info(f"Would migrate {len(api_response_users)} users from Auth0 to Descope")
+    else:
+        for user in api_response_users:            
+            create_descope_user(user)
 
-def process_roles(auth0_roles):
+def process_roles(auth0_roles, dry_run):
     """
     Process the Auth0 organizations - creating roles, permissions, and associating users
 
     Args:
     - auth0_roles (dict): Dictionary of roles fetched from Auth0
     """
-    for role in auth0_roles:
-        permissions = get_permissions_for_role(role["id"])
-        create_descope_role_and_permissions(role, permissions)
-        users = get_users_in_role(role["id"])
-        for user in users:
-            add_user_to_descope_role(user["email"],role["name"])
+    if dry_run:
+        logging.info(f"Would migrate {len(auth0_roles)} roles from Auth0 to Descope")
+        for role in auth0_roles:
+            permissions = get_permissions_for_role(role["id"])
+            logging.info(f"Would migrate {role['name']} with {len(permissions)} associated permissions.")
+    else:
+        for role in auth0_roles:
+            permissions = get_permissions_for_role(role["id"])
+            create_descope_role_and_permissions(role, permissions)
+            users = get_users_in_role(role["id"])
+            for user in users:
+                add_user_to_descope_role(user["email"],role["name"])
 
-def process_auth0_organizations(auth0_organizations):
+def process_auth0_organizations(auth0_organizations, dry_run):
     """
     Process the Auth0 organizations - creating tenants and associating users
 
     Args:
     - auth0_organizations (dict): Dictionary of organizations fetched from Auth0
     """
-    for organization in auth0_organizations:
-        create_descope_tenant(organization)   
-        org_members = fetch_auth0_organization_members(organization["id"])   
-        for user in org_members:
-            add_descope_user_to_tenant(organization["id"], user["email"])
+    if dry_run:
+        logging.info(f"Would migrate {len(auth0_organizations)} roles from Auth0 to Descope")
+        for organization in auth0_organizations:
+            org_members = fetch_auth0_organization_members(organization["id"])
+            logging.info(f"Would migrate {organization['display_name']} with {len(org_members)} associated users.")
+    else:
+        for organization in auth0_organizations:
+            create_descope_tenant(organization)   
+            org_members = fetch_auth0_organization_members(organization["id"])   
+            for user in org_members:
+                add_descope_user_to_tenant(organization["id"], user["email"])
 
 ### End Process Functions
