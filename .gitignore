@@ -4,6 +4,9 @@
 __pycache__/
 
 # ignore all .env files
-*.env*
+*.env
 
 /venv
+
+# ignore any migration logs
+migration_log*
