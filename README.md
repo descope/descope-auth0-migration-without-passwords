@@ -69,7 +69,7 @@ You can dry run the migration script which will allow you to see the number of u
 from Auth0 to Descope.
 
 ```
-python3 src/main.py
+python3 src/main.py --dry-run
 ```
 
 The output would appear similar to the following:
