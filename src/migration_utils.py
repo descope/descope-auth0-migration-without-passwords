@@ -19,7 +19,7 @@ from descope import (
 # datetime object containing current date and time
 now = datetime.now()
 
-dt_string = now.strftime("%d/%m/%Y_%H:%M:%S")
+dt_string = now.strftime("%d_%m_%Y_%H:%M:%S")
 logging_file_name = f'migration_log_{dt_string}.log'
 logging.basicConfig(filename=logging_file_name,
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -542,7 +542,7 @@ def process_roles(auth0_roles, dry_run):
         print(f"Would migrate {len(auth0_roles)} roles from Auth0 to Descope")
         for role in auth0_roles:
             permissions = get_permissions_for_role(role["id"])
-            logging.info(f"Would migrate {role['name']} with {len(permissions)} associated permissions.")
+            print(f"Would migrate {role['name']} with {len(permissions)} associated permissions.")
     else:
         print(f"Starting migration of {len(auth0_roles)} roles found via Auth0 API")
         for role in auth0_roles:
@@ -583,10 +583,10 @@ def process_auth0_organizations(auth0_organizations, dry_run):
     failed_users_added_tenants = []
     tenant_users = []
     if dry_run:
-        print(f"Would migrate {len(auth0_organizations)} roles from Auth0 to Descope")
+        print(f"Would migrate {len(auth0_organizations)} organizations from Auth0 to Descope")
         for organization in auth0_organizations:
             org_members = fetch_auth0_organization_members(organization["id"])
-            logging.info(f"Would migrate {organization['display_name']} with {len(org_members)} associated users.")
+            print(f"Would migrate {organization['display_name']} with {len(org_members)} associated users.")
     else:
         for organization in auth0_organizations:
             success, error = create_descope_tenant(organization)  
